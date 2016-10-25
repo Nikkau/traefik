@@ -138,7 +138,7 @@ func (provider *WebProvider) getHealthHandler(response http.ResponseWriter, requ
 }
 
 func (provider *WebProvider) getPingHandler(response http.ResponseWriter, request *http.Request) {
-	fmt.Fprintf(response, "OK")
+	response.Write([]byte("OK"))
 }
 
 func (provider *WebProvider) getConfigHandler(response http.ResponseWriter, request *http.Request) {
