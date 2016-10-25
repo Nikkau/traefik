@@ -9,7 +9,6 @@ import (
 	"runtime"
 
 	"github.com/codegangsta/negroni"
-	"github.com/containous/mux"
 	"github.com/containous/traefik/autogen"
 	"github.com/containous/traefik/log"
 	"github.com/containous/traefik/middlewares"
@@ -17,6 +16,7 @@ import (
 	"github.com/containous/traefik/types"
 	"github.com/containous/traefik/version"
 	"github.com/elazarl/go-bindata-assetfs"
+	"github.com/pressly/chi"
 	"github.com/thoas/stats"
 	"github.com/unrolled/render"
 )
@@ -52,60 +52,51 @@ func goroutines() interface{} {
 // using the given configuration channel.
 func (provider *WebProvider) Provide(configurationChan chan<- types.ConfigMessage, pool *safe.Pool, _ []types.Constraint) error {
 
-	systemRouter := mux.NewRouter()
+	systemRouter := chi.NewRouter()
 
 	// health route
-	systemRouter.Methods("GET").Path("/health").HandlerFunc(provider.getHealthHandler)
+	systemRouter.Get("/health", provider.getHealthHandler)
 
 	// ping route
-	systemRouter.Methods("GET").Path("/ping").HandlerFunc(provider.getPingHandler)
+	systemRouter.Get("/ping", provider.getPingHandler)
 	// API routes
-	systemRouter.Methods("GET").Path("/api").HandlerFunc(provider.getConfigHandler)
-	systemRouter.Methods("GET").Path("/api/version").HandlerFunc(provider.getVersionHandler)
-	systemRouter.Methods("GET").Path("/api/providers").HandlerFunc(provider.getConfigHandler)
-	systemRouter.Methods("GET").Path("/api/providers/{provider}").HandlerFunc(provider.getProviderHandler)
-	systemRouter.Methods("PUT").Path("/api/providers/{provider}").HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
-		if provider.ReadOnly {
-			response.WriteHeader(http.StatusForbidden)
-			fmt.Fprintf(response, "REST API is in read-only mode")
-			return
-		}
-		vars := mux.Vars(request)
-		if vars["provider"] != "web" {
-			response.WriteHeader(http.StatusBadRequest)
-			fmt.Fprintf(response, "Only 'web' provider can be updated through the REST API")
-			return
-		}
+	systemRouter.Get("/api", provider.getConfigHandler)
+	systemRouter.Get("/api/version", provider.getVersionHandler)
 
-		configuration := new(types.Configuration)
-		body, _ := ioutil.ReadAll(request.Body)
-		err := json.Unmarshal(body, configuration)
-		if err == nil {
-			configurationChan <- types.ConfigMessage{ProviderName: "web", Configuration: configuration}
-			provider.getConfigHandler(response, request)
-		} else {
-			log.Errorf("Error parsing configuration %+v", err)
-			http.Error(response, fmt.Sprintf("%+v", err), http.StatusBadRequest)
-		}
+	systemRouter.Get("/api/providers", provider.getConfigHandler)
+
+	systemRouter.Route("/api/providers", func(r chi.Router) {
+		r.Get("/:provider", provider.getProviderHandler)
+		r.Put("/:provider", provider.makePutProviderHandler(configurationChan))
+
+		r.Route("/:provider", func(r chi.Router) {
+			r.Get("/backends", provider.getBackendsHandler)
+
+			r.Route("/backends", func(r chi.Router) {
+				r.Get("/:backend", provider.getBackendHandler)
+				r.Get("/:backend/servers", provider.getServersHandler)
+				r.Get("/:backend/servers/:server", provider.getServerHandler)
+			})
+
+			r.Get("/frontends", provider.getFrontendsHandler)
+
+			r.Route("/frontends", func(r chi.Router) {
+				r.Get("/:frontend", provider.getFrontendHandler)
+				r.Get("/:frontend/routes", provider.getRoutesHandler)
+				r.Get("/:frontend/routes/:route", provider.getRouteHandler)
+			})
+		})
 	})
-	systemRouter.Methods("GET").Path("/api/providers/{provider}/backends").HandlerFunc(provider.getBackendsHandler)
-	systemRouter.Methods("GET").Path("/api/providers/{provider}/backends/{backend}").HandlerFunc(provider.getBackendHandler)
-	systemRouter.Methods("GET").Path("/api/providers/{provider}/backends/{backend}/servers").HandlerFunc(provider.getServersHandler)
-	systemRouter.Methods("GET").Path("/api/providers/{provider}/backends/{backend}/servers/{server}").HandlerFunc(provider.getServerHandler)
-	systemRouter.Methods("GET").Path("/api/providers/{provider}/frontends").HandlerFunc(provider.getFrontendsHandler)
-	systemRouter.Methods("GET").Path("/api/providers/{provider}/frontends/{frontend}").HandlerFunc(provider.getFrontendHandler)
-	systemRouter.Methods("GET").Path("/api/providers/{provider}/frontends/{frontend}/routes").HandlerFunc(provider.getRoutesHandler)
-	systemRouter.Methods("GET").Path("/api/providers/{provider}/frontends/{frontend}/routes/{route}").HandlerFunc(provider.getRouteHandler)
 
 	// Expose dashboard
-	systemRouter.Methods("GET").Path("/").HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+	systemRouter.Get("/", func(response http.ResponseWriter, request *http.Request) {
 		http.Redirect(response, request, "/dashboard/", 302)
 	})
-	systemRouter.Methods("GET").PathPrefix("/dashboard/").Handler(http.StripPrefix("/dashboard/", http.FileServer(&assetfs.AssetFS{Asset: autogen.Asset, AssetInfo: autogen.AssetInfo, AssetDir: autogen.AssetDir, Prefix: "static"})))
+	systemRouter.FileServer("/dashboard/", &assetfs.AssetFS{Asset: autogen.Asset, AssetInfo: autogen.AssetInfo, AssetDir: autogen.AssetDir, Prefix: "static"})
 
 	// expvars
 	if provider.server.globalConfiguration.Debug {
-		systemRouter.Methods("GET").Path("/debug/vars").HandlerFunc(expvarHandler)
+		systemRouter.Get("/debug/vars", expvarHandler)
 	}
 
 	go func() {
@@ -158,8 +149,7 @@ func (provider *WebProvider) getVersionHandler(response http.ResponseWriter, req
 }
 
 func (provider *WebProvider) getProviderHandler(response http.ResponseWriter, request *http.Request) {
-	vars := mux.Vars(request)
-	providerID := vars["provider"]
+	providerID := chi.URLParam(request, "provider")
 	currentConfigurations := provider.server.currentConfigurations.Get().(configs)
 	if provider, ok := currentConfigurations[providerID]; ok {
 		templatesRenderer.JSON(response, http.StatusOK, provider)
@@ -168,9 +158,34 @@ func (provider *WebProvider) getProviderHandler(response http.ResponseWriter, re
 	}
 }
 
+func (provider *WebProvider) makePutProviderHandler(configurationChan chan<- types.ConfigMessage) func(response http.ResponseWriter, request *http.Request) {
+	return func(response http.ResponseWriter, request *http.Request) {
+		if provider.ReadOnly {
+			response.WriteHeader(http.StatusForbidden)
+			fmt.Fprintf(response, "REST API is in read-only mode")
+			return
+		}
+		if chi.URLParam(request, "provider") != "web" {
+			response.WriteHeader(http.StatusBadRequest)
+			fmt.Fprintf(response, "Only 'web' provider can be updated through the REST API")
+			return
+		}
+
+		configuration := new(types.Configuration)
+		body, _ := ioutil.ReadAll(request.Body)
+		err := json.Unmarshal(body, configuration)
+		if err == nil {
+			configurationChan <- types.ConfigMessage{ProviderName: "web", Configuration: configuration}
+			provider.getConfigHandler(response, request)
+		} else {
+			log.Errorf("Error parsing configuration %+v", err)
+			http.Error(response, fmt.Sprintf("%+v", err), http.StatusBadRequest)
+		}
+	}
+}
+
 func (provider *WebProvider) getBackendsHandler(response http.ResponseWriter, request *http.Request) {
-	vars := mux.Vars(request)
-	providerID := vars["provider"]
+	providerID := chi.URLParam(request, "provider")
 	currentConfigurations := provider.server.currentConfigurations.Get().(configs)
 	if provider, ok := currentConfigurations[providerID]; ok {
 		templatesRenderer.JSON(response, http.StatusOK, provider.Backends)
@@ -180,9 +195,8 @@ func (provider *WebProvider) getBackendsHandler(response http.ResponseWriter, re
 }
 
 func (provider *WebProvider) getBackendHandler(response http.ResponseWriter, request *http.Request) {
-	vars := mux.Vars(request)
-	providerID := vars["provider"]
-	backendID := vars["backend"]
+	providerID := chi.URLParam(request, "provider")
+	backendID := chi.URLParam(request, "backend")
 	currentConfigurations := provider.server.currentConfigurations.Get().(configs)
 	if provider, ok := currentConfigurations[providerID]; ok {
 		if backend, ok := provider.Backends[backendID]; ok {
@@ -194,9 +208,8 @@ func (provider *WebProvider) getBackendHandler(response http.ResponseWriter, req
 }
 
 func (provider *WebProvider) getServersHandler(response http.ResponseWriter, request *http.Request) {
-	vars := mux.Vars(request)
-	providerID := vars["provider"]
-	backendID := vars["backend"]
+	providerID := chi.URLParam(request, "provider")
+	backendID := chi.URLParam(request, "backend")
 	currentConfigurations := provider.server.currentConfigurations.Get().(configs)
 	if provider, ok := currentConfigurations[providerID]; ok {
 		if backend, ok := provider.Backends[backendID]; ok {
@@ -208,10 +221,9 @@ func (provider *WebProvider) getServersHandler(response http.ResponseWriter, req
 }
 
 func (provider *WebProvider) getServerHandler(response http.ResponseWriter, request *http.Request) {
-	vars := mux.Vars(request)
-	providerID := vars["provider"]
-	backendID := vars["backend"]
-	serverID := vars["server"]
+	providerID := chi.URLParam(request, "provider")
+	backendID := chi.URLParam(request, "backend")
+	serverID := chi.URLParam(request, "server")
 	currentConfigurations := provider.server.currentConfigurations.Get().(configs)
 	if provider, ok := currentConfigurations[providerID]; ok {
 		if backend, ok := provider.Backends[backendID]; ok {
@@ -225,8 +237,7 @@ func (provider *WebProvider) getServerHandler(response http.ResponseWriter, requ
 }
 
 func (provider *WebProvider) getFrontendsHandler(response http.ResponseWriter, request *http.Request) {
-	vars := mux.Vars(request)
-	providerID := vars["provider"]
+	providerID := chi.URLParam(request, "provider")
 	currentConfigurations := provider.server.currentConfigurations.Get().(configs)
 	if provider, ok := currentConfigurations[providerID]; ok {
 		templatesRenderer.JSON(response, http.StatusOK, provider.Frontends)
@@ -236,9 +247,8 @@ func (provider *WebProvider) getFrontendsHandler(response http.ResponseWriter, r
 }
 
 func (provider *WebProvider) getFrontendHandler(response http.ResponseWriter, request *http.Request) {
-	vars := mux.Vars(request)
-	providerID := vars["provider"]
-	frontendID := vars["frontend"]
+	providerID := chi.URLParam(request, "provider")
+	frontendID := chi.URLParam(request, "frontend")
 	currentConfigurations := provider.server.currentConfigurations.Get().(configs)
 	if provider, ok := currentConfigurations[providerID]; ok {
 		if frontend, ok := provider.Frontends[frontendID]; ok {
@@ -250,9 +260,8 @@ func (provider *WebProvider) getFrontendHandler(response http.ResponseWriter, re
 }
 
 func (provider *WebProvider) getRoutesHandler(response http.ResponseWriter, request *http.Request) {
-	vars := mux.Vars(request)
-	providerID := vars["provider"]
-	frontendID := vars["frontend"]
+	providerID := chi.URLParam(request, "provider")
+	frontendID := chi.URLParam(request, "frontend")
 	currentConfigurations := provider.server.currentConfigurations.Get().(configs)
 	if provider, ok := currentConfigurations[providerID]; ok {
 		if frontend, ok := provider.Frontends[frontendID]; ok {
@@ -264,11 +273,9 @@ func (provider *WebProvider) getRoutesHandler(response http.ResponseWriter, requ
 }
 
 func (provider *WebProvider) getRouteHandler(response http.ResponseWriter, request *http.Request) {
-
-	vars := mux.Vars(request)
-	providerID := vars["provider"]
-	frontendID := vars["frontend"]
-	routeID := vars["route"]
+	providerID := chi.URLParam(request, "provider")
+	frontendID := chi.URLParam(request, "frontend")
+	routeID := chi.URLParam(request, "route")
 	currentConfigurations := provider.server.currentConfigurations.Get().(configs)
 	if provider, ok := currentConfigurations[providerID]; ok {
 		if frontend, ok := provider.Frontends[frontendID]; ok {

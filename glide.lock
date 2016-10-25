@@ -1,5 +1,5 @@
-hash: 39ff28cc1d13d5915a870b14491ece1849c4eaf5a56cecd50a7676ecee6c6143
-updated: 2016-10-06T14:06:39.455848971+02:00
+hash: d329e0fd02ca71bb9dcdbe92986ba64c73763680d384de372dcf0654d481e251
+updated: 2016-10-25T15:52:00.164199511+02:00
 imports:
 - name: github.com/abbot/go-http-auth
   version: cb4372376e1e00e9f6ab9ec142e029302c9e7140
@@ -238,6 +238,8 @@ imports:
   version: d8ed2627bdf02c080bf22230dbb337003b7aba2d
   subpackages:
   - difflib
+- name: github.com/pressly/chi
+  version: f1a5099f0f1da61a5c2d5c75b0376608df0e00bd
 - name: github.com/ryanuber/go-glob
   version: 572520ed46dbddaed19ea3d9541bdd0494163693
 - name: github.com/samuel/go-zookeeper
@@ -340,7 +342,7 @@ testImports:
 - name: github.com/libkermit/docker-check
   version: cbe0ef03b3d23070eac4d00ba8828f2cc7f7e5a3
 - name: github.com/spf13/pflag
-  version: 08b1a584251b5b62f458943640fc8ebd4d50aaa5
+  version: 5644820622454e71517561946e3d94b9f9db6842
 - name: github.com/vbatts/tar-split
   version: bd4c5d64c3e9297f410025a3b1bd0c58f659e721
   subpackages:
